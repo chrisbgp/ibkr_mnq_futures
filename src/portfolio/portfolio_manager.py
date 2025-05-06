@@ -136,6 +136,24 @@ class PortfolioManager:
     def place_bracket_order(self, contract: Contract = None):
         """Place a bracket order"""
         logging.debug("Placing bracket order.")
+
+        # Ensure positions are synchronized to check current state accurately
+        # update_positions calls _synchronize_positions_with_api
+        self.update_positions() 
+
+        # Check if there's already an active position (quantity > 0 for any instrument)
+        # self.positions is List[Position] reflecting the API state.
+        active_position_exists = False
+        for pos_obj in self.positions:
+            if pos_obj.quantity > 0:
+                active_position_exists = True
+                logging.info(f"PortfolioManager: Found existing active position: {pos_obj.ticker} (ConID: {pos_obj.contract_id}), Quantity: {pos_obj.quantity}.")
+                break
+        
+        if active_position_exists:
+            logging.warning("PortfolioManager: An active position already exists. Not placing new bracket order to avoid multiple active positions.")
+            return
+
         contract = self.get_current_contract() if contract is None else contract
 
         mid_price = self.api.get_latest_mid_price(contract)
