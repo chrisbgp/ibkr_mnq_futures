@@ -49,107 +49,46 @@ class PortfolioManager:
             for order, _, _ in bracket_order_items: # Corrected unpacking for 3-element tuple
                 logging.info(f"Order: {str(order)}")
         
-        self.api.request_open_orders() # Ensures self.api.open_orders is populated for other uses if needed
+        self.api.request_open_orders() # Ensures self.api.open_orders is populated
 
         if len(self.orders) > 0:
             filled_count, cancelled_count, pending_count = self._get_order_status_count()
-            logging.debug(f"Order statuses: {filled_count} filled, {cancelled_count} cancelled, {pending_count} pending")
+            logging.debug(f"Order statuses before processing: {filled_count} filled, {cancelled_count} cancelled, {pending_count} pending")
 
+        # Process orders to update their status in DB and mark as handled
         for bracket_idx, bracket_order_items in enumerate(self.orders):
-            
             for order_idx, (order, contract_obj, already_handled) in enumerate(bracket_order_items):
-                
+                if already_handled:
+                    continue
+
                 order_status = self._get_order_status(order.orderId)
+                if not order_status:
+                    logging.warning(f"Could not retrieve status for order {order.orderId}. Skipping processing for this order.")
+                    continue
                 
-                if order_status['status'] == 'Filled' and not already_handled:
-                    if contract_obj is None:
-                        logging.warning(f"Order {order.orderId} is filled but contract details are missing. Cannot update position from this order. This might happen for orders loaded from DB without full contract info.")
-                        # Mark as handled to avoid reprocessing this warning, or decide on other error handling
-                        self.orders[bracket_idx][order_idx] = (order, contract_obj, True)
-                        continue
+                current_status_str = order_status.get('status')
 
-                    # Use the contract_obj stored with the order
-                    # Handle filled BUY orders (Limit or Market)
-                    if order.action == 'BUY' and (order.orderType == 'LMT' or order.orderType == 'MKT'):
+                if current_status_str in ['Filled', 'Cancelled', 'ApiCancelled']: # Consider various forms of "done"
+                    logging.info(f"Order {order.orderId} (Type: {order.orderType}, Action: {order.action}) has status: {current_status_str}. Updating DB and marking as handled.")
+                    self.db.update_order_status(order.orderId, order_status)
+                    self.orders[bracket_idx][order_idx] = (order, contract_obj, True) # Mark as handled
+                # Optionally, handle other statuses if specific DB logging is needed for them,
+                # but primarily interested in terminal states here for the "handled" flag.
 
-                        if len(self.positions) == 0:
-                            logging.info(f"{order.orderType} Buy order filled, creating new position.")
-
-                            position = Position(
-                            ticker=contract_obj.symbol,
-                            security=contract_obj.secType,
-                            currency=contract_obj.currency,
-                            expiry=contract_obj.lastTradeDateOrContractMonth,
-                            contract_id=contract_obj.conId,
-                            quantity=int(order.totalQuantity),
-                            avg_price=order_status['avg_fill_price'],
-                            timezone=self.config.timezone,
-                            )
-
-                            self.positions.append(position)
-                            self.db.add_position(position)
-
-                            self.db.update_order_status(order.orderId, order_status)
-
-                            self.orders[bracket_idx][order_idx] = (order, contract_obj, True)
-
-                        else:
-                            logging.info(f"{order.orderType} Buy order filled, updating position.")
-
-                            position = copy.deepcopy(self.positions[-1])
-
-                            total_quantity = position.quantity + int(order.totalQuantity)
-                            avg_price = position.quantity * position.avg_price
-                            avg_price += int(order.totalQuantity) * order_status['avg_fill_price'] 
-                            avg_price /= total_quantity
-
-                            position.quantity = total_quantity
-                            position.avg_price = avg_price
-
-                            self.orders[bracket_idx][order_idx] = (order, contract_obj, True)
-                            
-                            self.positions.append(position)
-                            self.db.add_position(position)
-
-                            self.db.update_order_status(order.orderId, order_status)
-
-                    # Handle filled SELL orders (Limit, Market or Stop)
-                    elif order.action == 'SELL' and (order.orderType == 'LMT' or order.orderType == 'MKT' or order.orderType == 'STP'):
-
-                        logging.info(f"{order.orderType} Sell order filled, updating position.")
-
-                        position = copy.deepcopy(self.positions[-1])
-
-                        new_quantity = position.quantity - int(order.totalQuantity)
-                        
-                        # For a SELL, the avg_price (cost basis per share) of the position does not change.
-                        # PnL is realized, but the cost basis of remaining shares is the same.
-                        # If new_quantity is 0, this position object represents the closed state.
-                        # The original avg_price is retained on this Position object.
-                        
-                        position.quantity = new_quantity
-                        # position.avg_price remains position.avg_price from self.positions[-1]
-                        
-                        self.orders[bracket_idx][order_idx] = (order, contract_obj, True)
-
-                        self.positions.append(position)
-                        self.db.add_position(position)
-
-                        self.db.update_order_status(order.orderId, order_status)
-
-                    else:
-
-                        raise TypeError(f"Order type {order.orderType} with action {order.action} is not supported.")
+        logging.info(f"{self.__class__.__name__}: Finished processing order statuses.")
         
-        msg = f"{self.__class__.__name__}: Finished updating positions from orders."
-        msg += f" Currently {len(self.positions)} position(s)."
-
+        # Synchronize in-memory positions and DB with the API's current state
+        self._synchronize_positions_with_api()
+        
+        # Logging after synchronization
+        msg = f"{self.__class__.__name__}: Finished updating positions. In-memory positions reflect API."
+        msg += f" Currently {len(self.positions)} position(s) in memory."
         logging.info(msg)
         if len(self.positions) > 0:
-            for position in self.positions:
-                logging.info(str(position))
+            for position_obj in self.positions: # self.positions now contains Position objects from API
+                logging.info(str(position_obj))
 
-        self.db.print_all_entries()
+        self.db.print_all_entries() # Log current DB state
 
     def daily_pnl(self):
         """Update the daily PnL. The daily pnl is made up from the PnL of all filled orders."""
@@ -421,8 +360,8 @@ class PortfolioManager:
             matching_position_data = self.api.get_matching_position(position)
 
             ibkr_quantity = 0
-            if matching_position_data is not None:
-                ibkr_quantity = int(matching_position_data['position'])
+            if matching_position_data is not None: # matching_position_data is a Position object or None
+                ibkr_quantity = matching_position_data.quantity # Access quantity attribute
 
             if position.quantity > 0 and ibkr_quantity == 0:
                 # Local state says open, IBKR says closed/none. Correct local state.
@@ -517,6 +456,78 @@ class PortfolioManager:
         self.orders = []
         self.positions = []
         self.order_statuses = {}
+
+    def _synchronize_positions_with_api(self):
+        logging.info("PortfolioManager: Starting API position synchronization.")
+        
+        # 1. Fetch current positions from API
+        api_positions_list = self.api.get_positions() # List[Position]
+        api_positions_map = {pos.contract_id: pos for pos in api_positions_list}
+        
+        # Update in-memory self.positions to reflect API truth
+        self.positions = api_positions_list # self.positions now holds Position objects from API
+        logging.info(f"PortfolioManager: In-memory self.positions updated with {len(self.positions)} positions from API.")
+
+        # 2. Fetch relevant current positions from Database to compare against API
+        # Consider positions from the current trading day or those with non-zero quantity.
+        trading_day_start = trading_day_start_time_ts(self.config.trading_start_time, self.config.timezone)
+        db_positions_to_check = []
+        # Assuming get_all_orders_and_positions returns a dict with a 'positions' key holding list of position dicts
+        raw_db_positions_list = self.db.get_all_orders_and_positions().get('positions', []) 
+        for pos_dict in raw_db_positions_list:
+            # Ensure 'created_timestamp' and 'quantity' keys exist or provide defaults
+            created_timestamp_str = pos_dict.get('created_timestamp')
+            quantity = int(pos_dict.get('quantity', 0))
+            
+            is_from_current_day = False
+            if created_timestamp_str:
+                try:
+                    is_from_current_day = pd.to_datetime(created_timestamp_str) > trading_day_start
+                except Exception as e:
+                    logging.warning(f"Could not parse created_timestamp '{created_timestamp_str}' for position: {e}")
+
+            if quantity > 0 or is_from_current_day:
+                try:
+                    db_positions_to_check.append(Position.from_dict(pos_dict))
+                except Exception as e:
+                    logging.error(f"Could not convert DB position dict to Position object: {pos_dict}, Error: {e}")
+        
+        db_positions_map = {pos.contract_id: pos for pos in db_positions_to_check}
+        
+        # 3. Reconcile API positions with DB: Update existing in DB or add new from API
+        for api_con_id, api_pos_obj in api_positions_map.items():
+            db_pos_obj = db_positions_map.get(api_con_id)
+
+            if db_pos_obj: # Position exists in DB, check for updates
+                if db_pos_obj.quantity != api_pos_obj.quantity or \
+                   (api_pos_obj.quantity > 0 and db_pos_obj.avg_price != api_pos_obj.avg_price): # Compare relevant fields
+                    logging.info(f"PortfolioManager: Updating DB position for {api_pos_obj.ticker} (ID: {api_con_id}). "
+                                 f"DB Qty: {db_pos_obj.quantity}, DB AvgPx: {db_pos_obj.avg_price} -> "
+                                 f"API Qty: {api_pos_obj.quantity}, API AvgPx: {api_pos_obj.avg_price}.")
+                    self.db.add_position(api_pos_obj) # add_position in DB likely handles updates by ID
+            else: # Position from API is not in DB, add if it has quantity
+                if api_pos_obj.quantity > 0:
+                    logging.info(f"PortfolioManager: New API position for {api_pos_obj.ticker} (ID: {api_con_id}) "
+                                 f"Qty: {api_pos_obj.quantity}, AvgPx: {api_pos_obj.avg_price}. Adding to DB.")
+                    self.db.add_position(api_pos_obj)
+        
+        # 4. Reconcile DB positions with API: Mark positions in DB as closed if not in API
+        for db_con_id, db_pos_obj in db_positions_map.items():
+            if db_con_id not in api_positions_map: # Was in DB (and considered active/recent), but not in current API report
+                if db_pos_obj.quantity > 0: # And DB thought it was open
+                    logging.info(f"PortfolioManager: Position for {db_pos_obj.ticker} (ID: {db_con_id}) "
+                                 f"with Qty: {db_pos_obj.quantity} in DB, but not in API. Marking as closed in DB.")
+                    db_pos_obj.quantity = 0
+                    db_pos_obj.avg_price = 0.0 # Reset avg_price for closed position
+                    self.db.add_position(db_pos_obj) # Record closure
+
+        logging.info("PortfolioManager: API position synchronization complete. DB reflects API state.")
+        # Log final in-memory positions (which mirror API)
+        if len(self.positions) > 0:
+            for p_idx, p_obj in enumerate(self.positions):
+                logging.info(f"  In-memory Position [{p_idx}]: {str(p_obj)}")
+        else:
+            logging.info("PortfolioManager: No active positions in memory (reflects API).")
 
     def populate_from_db(self, check_state: bool = True):
         """Populate the orders from the database. Only orders created after the 

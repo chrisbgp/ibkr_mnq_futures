@@ -301,12 +301,21 @@ class IBConnection(EWrapper, EClient):
     
     def position(self, account: str, contract: Contract, pos: float, avg_cost: float):
         """Callback for position updates"""
-        if account in self.positions:
-            self.positions[account].append({
-                'contract': contract,
-                'position': pos,
-                'avg_cost': avg_cost
-            })
+        if account not in self.positions: # Ensure the list exists for the account
+            self.positions[account] = []
+
+        # Create a Position object
+        position_obj = Position(
+            ticker=contract.symbol,
+            security=contract.secType,
+            currency=contract.currency,
+            expiry=contract.lastTradeDateOrContractMonth,
+            contract_id=contract.conId,
+            quantity=int(pos), # pos is float, Position expects int
+            avg_price=avg_cost,
+            timezone=self.timezone # Use the IBConnection's timezone
+        )
+        self.positions[account].append(position_obj)
 
     def positionEnd(self):
         """Callback for end of position stream"""
@@ -543,15 +552,14 @@ class IBConnection(EWrapper, EClient):
             positions = self.get_positions()
         
             matching_position = None
-            for native_position in positions:
-
-                native_contract = native_position['contract']
-
-                if (contract.symbol == native_contract.symbol and 
-                    contract.secType == native_contract.secType and
-                    contract.currency == native_contract.currency and
-                    contract.lastTradeDateOrContractMonth == native_contract.lastTradeDateOrContractMonth):
-                    matching_position = native_position
+            for api_position_obj in positions: # api_position_obj is a Position object
+                # Compare attributes of the input 'contract' with the 'Position' object's attributes
+                if (contract.symbol == api_position_obj.ticker and
+                    contract.secType == api_position_obj.security and
+                    contract.currency == api_position_obj.currency and
+                    contract.lastTradeDateOrContractMonth == api_position_obj.expiry and
+                    contract.conId == api_position_obj.contract_id): # Added conId check for robustness
+                    matching_position = api_position_obj # Return the Position object itself
                     break # Found the matching contract, no need to check further
 
             return matching_position
