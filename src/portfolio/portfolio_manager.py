@@ -90,7 +90,7 @@ class PortfolioManager:
                             self.orders[bracket_idx][order_idx] = (order, True)
 
                         else:
-                            logging.info(f"Buy order filled, updating position.")
+                            logging.info(f"{order.orderType} Buy order filled, updating position.")
 
                             position = copy.deepcopy(self.positions[-1])
 
@@ -275,53 +275,77 @@ class PortfolioManager:
         for bracket_order in self.orders:
 
             for order, _ in bracket_order:
+                # Check status only if it exists
+                order_status_data = self._get_order_status(order.orderId)
+                if not order_status_data:
+                    logging.warning(f"Could not get status for order {order.orderId} while checking for pending orders.")
+                    continue # Skip if status is unavailable
 
-                order_status = self._get_order_status(order.orderId)['status']
+                order_status = order_status_data['status']
 
-                if (order.orderType == 'MKT' and 
+                # Check if the order is a Limit order and is still pending (not Filled or Cancelled)
+                if (order.orderType == 'LMT' and
                     order_status != 'Filled' and
                     order_status != 'Cancelled'):
-
+                    # Found a pending order
                     return True
-                
-        return False
+
+        return False # No pending orders found
 
     def current_position_quantity(self):
         return self.positions[-1].quantity if len(self.positions) > 0 else 0
 
     def check_cancelled_market_order(self):
-        """Check for cancelled market orders and resubmit them if required."""
-        logging.debug("Checking for cancelled market orders.")
+        """Check for cancelled limit orders and resubmit them if required."""
+        # Note: Function name kept as requested, but logic changed for LMT orders.
+        logging.debug("Checking for cancelled limit orders.")
 
         found_cancelled_order = False
+        orders_to_resubmit = [] # Collect orders to resubmit outside the loop
 
-        for bracket_order in self.orders:
+        for bracket_idx, bracket_order in enumerate(self.orders):
+            for order_idx, (order, already_handled) in enumerate(bracket_order):
+                # Check status only if it exists
+                order_status_data = self._get_order_status(order.orderId)
+                if not order_status_data:
+                    logging.warning(f"Could not get status for order {order.orderId} while checking for cancellations.")
+                    continue # Skip if status is unavailable
 
-            for order, already_resubmitted in bracket_order:
+                order_status = order_status_data['status']
 
-                order_status = self._get_order_status(order.orderId)['status']
-
-                if (not already_resubmitted and 
-                    order.orderType == 'MKT' and
+                if (not already_handled and
+                    order.orderType == 'LMT' and # Check for LMT instead of MKT
                     order_status == "Cancelled"):
 
                     logging.warning(f"Order type: {order.orderType}, id:{order.orderId}, was cancelled.")
                     found_cancelled_order = True
 
                     if self.config.resubmit_cancelled_order:
-
-                        logging.info(f"Resubmitting order type: {order.orderType}, id:{order.orderId}.")
-                        already_resubmitted = True
-
+                        logging.info(f"Marking order type: {order.orderType}, id:{order.orderId} for resubmission.")
+                        # Mark as handled to prevent repeated attempts in this cycle
+                        self.orders[bracket_idx][order_idx] = (order, True)
+                        # Get contract details needed for resubmission
+                        # Need to request open orders if not already done recently
+                        self.api.request_open_orders()
+                        time.sleep(0.5) # Give time for open orders to potentially populate
                         order_details = self.api.get_open_order(order.orderId)
-
-                        self.place_bracket_order(order_details['contract'])
+                        if order_details and 'contract' in order_details:
+                             orders_to_resubmit.append(order_details['contract'])
+                        else:
+                             logging.error(f"Could not get contract details for cancelled order {order.orderId}. Cannot resubmit.")
 
                     else:
                         logging.info(f"Not resubmitting cancelled order type: {order.orderType}, id:{order.orderId}.")
+                        # Mark as handled even if not resubmitting
+                        self.orders[bracket_idx][order_idx] = (order, True)
+
+        # Resubmit collected orders outside the iteration
+        for contract in orders_to_resubmit:
+             logging.info(f"Resubmitting order for contract {contract.symbol} {contract.lastTradeDateOrContractMonth}")
+             self.place_bracket_order(contract) # place_bracket_order now places a limit order
 
         if not found_cancelled_order:
-            logging.debug("No cancelled orders found.")
+            logging.debug("No cancelled limit orders found.")
         
     def get_current_contract(self): 
         """Get the current contract"""

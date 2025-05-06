@@ -442,45 +442,28 @@ class IBConnection(EWrapper, EClient):
 
     def create_bracket_order(self,
                              action:str,
-                             quantity:float, 
-                             take_profit_limit_price:float, 
-                             stop_loss_price:float):
-        """Create a bracket order"""
-        parent_order_id = self.next_order_id
+                             quantity:float,
+                             take_profit_limit_price:float,
+                             stop_loss_price:float): # stop_loss_price is ignored
+        """
+        Creates a single limit order.
+        Note: The name 'create_bracket_order' is kept for compatibility as requested,
+              but it now generates a single Limit order using take_profit_limit_price.
+              The stop_loss_price parameter is ignored.
+        """
+        order = Order()
+        order.orderId = self.next_order_id
         self.next_order_id += 1
 
-        parent = Order()
-        parent.orderId = parent_order_id
-        parent.action = action
-        parent.orderType = "MKT"
-        parent.totalQuantity = quantity
-        parent.transmit = False
+        order.action = action
+        order.orderType = "LMT"
+        order.totalQuantity = quantity
+        order.lmtPrice = take_profit_limit_price
+        order.transmit = True # Transmit the single order immediately
+        # Consider adding order.outsideRth = True if needed
 
-        takeProfit = Order()
-        takeProfit.orderId = self.next_order_id
-        takeProfit.action = "SELL" if action == "BUY" else "BUY"
-        takeProfit.orderType = "LMT"
-        takeProfit.totalQuantity = quantity
-        takeProfit.lmtPrice = take_profit_limit_price
-        takeProfit.parentId = parent_order_id
-        takeProfit.transmit = False
-
-        self.next_order_id += 1
-
-        stopLoss = Order()
-        stopLoss.orderId = self.next_order_id
-        stopLoss.action = "SELL" if action == "BUY" else "BUY" 
-        stopLoss.orderType = "STP"
-        stopLoss.auxPrice = stop_loss_price
-        stopLoss.totalQuantity = quantity
-        stopLoss.parentId = parent_order_id
-        stopLoss.transmit = True
-        stopLoss.outsideRth = True
-
-        self.next_order_id += 1
-
-        bracketOrder = [parent, takeProfit, stopLoss]
-        return bracketOrder
+        limitOrder = [order]
+        return limitOrder
 
     def request_open_orders(self):
         if not self.open_orders_requested:
