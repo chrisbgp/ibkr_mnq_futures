@@ -120,13 +120,15 @@ class PortfolioManager:
 
                         position = copy.deepcopy(self.positions[-1])
 
-                        total_quantity = position.quantity - int(order.totalQuantity)
-                        avg_price = position.quantity * position.avg_price
-                        avg_price += int(order.totalQuantity) * order_status['avg_fill_price'] 
-                        avg_price /= (position.quantity + int(order.totalQuantity)) # Denominator should be sum of quantities before assignment
-
-                        position.quantity = total_quantity
-                        position.avg_price = avg_price
+                        new_quantity = position.quantity - int(order.totalQuantity)
+                        
+                        # For a SELL, the avg_price (cost basis per share) of the position does not change.
+                        # PnL is realized, but the cost basis of remaining shares is the same.
+                        # If new_quantity is 0, this position object represents the closed state.
+                        # The original avg_price is retained on this Position object.
+                        
+                        position.quantity = new_quantity
+                        # position.avg_price remains position.avg_price from self.positions[-1]
                         
                         self.orders[bracket_idx][order_idx] = (order, contract_obj, True)
 
@@ -185,9 +187,10 @@ class PortfolioManager:
                         raise TypeError(f"Order type {order.orderType} with action {order.action} is not supported.")
                     
                     filled_count += 1
-                
-            if filled_count >= 2:
-                index_pnl += current_order_pnl
+            
+            # For single order logic, each filled order contributes to PnL.
+            # The filled_count >= 2 logic was for bracket orders (entry + exit).
+            index_pnl += current_order_pnl
 
         return index_pnl * self.config.mnq_point_value
 
