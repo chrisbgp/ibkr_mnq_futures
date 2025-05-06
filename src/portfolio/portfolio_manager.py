@@ -162,11 +162,13 @@ class PortfolioManager:
 
                 if order_status['status'] == 'Filled':
                     
-                    if order.orderType == 'STP' or order.orderType == 'LMT' and order.action == 'SELL':
+                    if order.orderType == 'STP' or \
+                       (order.orderType == 'LMT' and order.action == 'SELL'): # Explicit parentheses for LMT SELL
 
                         current_order_pnl += order_status['avg_fill_price'] * int(order_status['filled'])
 
-                    elif order.orderType == 'MKT' and order.action == 'BUY':
+                    elif (order.orderType == 'MKT' and order.action == 'BUY') or \
+                         (order.orderType == 'LMT' and order.action == 'BUY'): # Added LMT BUY condition
 
                         current_order_pnl -= order_status['avg_fill_price'] * int(order_status['filled'])
 
