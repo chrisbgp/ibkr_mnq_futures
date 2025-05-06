@@ -45,8 +45,8 @@ class PortfolioManager:
         logging.info(f"{self.__class__.__name__}: Updating positions from orders.")
         logging.debug(f"{self.__class__.__name__}: There are {self._total_orders()} orders")
 
-        for bracket_order in self.orders:
-            for order, _ in bracket_order:
+        for bracket_order_items in self.orders: # Renamed for clarity, iterates over List[(Order, Contract, bool)]
+            for order, _, _ in bracket_order_items: # Corrected unpacking for 3-element tuple
                 logging.info(f"Order: {str(order)}")
         
         self.api.request_open_orders() # Ensures self.api.open_orders is populated for other uses if needed
