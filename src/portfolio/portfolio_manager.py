@@ -593,89 +593,13 @@ class PortfolioManager:
             if time_created > trading_day_start:
                 self.positions.append(Position.from_dict(position))
 
-        logging.debug(f"Loaded {len(self.positions)} positions from database initially.")
+        logging.debug(f"Loaded {len(self.positions)} positions from database initially.") # self.positions is from DB here
 
-        # Synchronize with IBKR API positions
-        logging.info("PortfolioManager: Synchronizing loaded positions with IBKR API.")
-        ibkr_api_positions_raw = self.api.get_positions() # List of dicts {'contract': Contract, 'position': float, 'avg_cost': float}
+        # Synchronize with IBKR API positions. This will update self.positions to API state and sync DB.
+        self._synchronize_positions_with_api()
         
-        # Convert API positions to a dictionary keyed by contract_id for easier lookup
-        ibkr_api_positions_map = {}
-        for pos_data in ibkr_api_positions_raw:
-            contract = pos_data['contract']
-            # API position can be float (e.g., 0.0), ensure int for quantity.
-            quantity = int(pos_data['position']) 
-            avg_cost = float(pos_data['avg_cost'])
-            ibkr_api_positions_map[contract.conId] = {
-                'contract': contract, 
-                'quantity': quantity, 
-                'avg_cost': avg_cost
-            }
-
-        # Use a dictionary for current self.positions (initially loaded from DB) for efficient lookup and update.
-        # This map will hold Position objects.
-        current_in_memory_positions_map = {p.contract_id: p for p in self.positions}
-        
-        processed_api_con_ids = set() # To track con_ids reported by API
-
-        # Iterate through positions reported by the API
-        for con_id, api_pos_details in ibkr_api_positions_map.items():
-            processed_api_con_ids.add(con_id)
-            api_contract = api_pos_details['contract']
-            api_quantity = api_pos_details['quantity'] # This is now an int
-            api_avg_cost = api_pos_details['avg_cost']
-
-            local_pos_obj = current_in_memory_positions_map.get(con_id)
-
-            if local_pos_obj: # Position already exists in our local memory (came from DB)
-                # Check if API state differs from local state
-                if local_pos_obj.quantity != api_quantity or \
-                   (api_quantity > 0 and local_pos_obj.avg_price != api_avg_cost): # Only compare avg_price if there's a position
-                    logging.info(f"PortfolioManager: Updating position for {api_contract.symbol} (ID: {con_id}). "
-                                 f"Local Qty: {local_pos_obj.quantity}, Local AvgPx: {local_pos_obj.avg_price} -> "
-                                 f"API Qty: {api_quantity}, API AvgPx: {api_avg_cost}.")
-                    local_pos_obj.quantity = api_quantity
-                    local_pos_obj.avg_price = api_avg_cost if api_quantity > 0 else 0.0
-                    self.db.add_position(local_pos_obj) # Record the updated state in DB
-            else: # Position reported by API is new to our local memory
-                if api_quantity > 0: # Only create a new local record if API shows an actual holding
-                    logging.info(f"PortfolioManager: New position from API for {api_contract.symbol} (ID: {con_id}): "
-                                 f"Qty: {api_quantity}, AvgPx: {api_avg_cost}. Adding to local state and DB.")
-                    new_pos_obj = Position(
-                        ticker=api_contract.symbol,
-                        security=api_contract.secType,
-                        currency=api_contract.currency,
-                        expiry=api_contract.lastTradeDateOrContractMonth,
-                        contract_id=con_id,
-                        quantity=api_quantity,
-                        avg_price=api_avg_cost,
-                        timezone=self.config.timezone
-                    )
-                    current_in_memory_positions_map[con_id] = new_pos_obj # Add to our map
-                    self.db.add_position(new_pos_obj) # Record this new position in DB
-        
-        # Check for positions in local memory (from DB) that were NOT reported by API (implies closure)
-        for con_id, local_pos_obj in current_in_memory_positions_map.items():
-            if con_id not in processed_api_con_ids: # This contract was in DB but not in API's list at all
-                if local_pos_obj.quantity > 0: # If local DB thought it had a position
-                    logging.info(f"PortfolioManager: Position for {local_pos_obj.ticker} (ID: {con_id}) "
-                                 f"with Qty: {local_pos_obj.quantity} in local state, but not in API's current report. Marking as closed.")
-                    local_pos_obj.quantity = 0
-                    local_pos_obj.avg_price = 0.0 # Avg price for zero quantity is zero
-                    self.db.add_position(local_pos_obj) # Record the closure in DB
-
-        # Reconstruct self.positions list from the synchronized map.
-        # This list should primarily track actively held positions.
-        self.positions = [pos for pos in current_in_memory_positions_map.values() if pos.quantity > 0]
-
-        logging.info("PortfolioManager: Positions after API synchronization:")
-        if len(self.positions) > 0:
-            for p_idx, p_obj in enumerate(self.positions):
-                logging.info(f"  Synced Position [{p_idx}]: {str(p_obj)}")
-        else:
-            logging.info("PortfolioManager: No active positions after API synchronization.")
-        
-        # The existing consistency check will now run on the API-synchronized self.positions
+        # The existing consistency check will now run on the API-synchronized self.positions.
+        # self.positions is now authoritative (from API).
         if check_state:
             if len(self.positions) > 0:
                 # The original logic takes self.positions[-1].
