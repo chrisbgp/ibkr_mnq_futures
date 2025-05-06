@@ -437,14 +437,31 @@ class PortfolioManager:
             contract.lastTradeDateOrContractMonth = position.expiry
 
             # Place the order
-            order_id, _ = self.api.place_market_order(contract, "SELL", position.quantity)
-            order_details = self.api.get_open_order(order_id)
-            self.orders.append([(order_details['order'], False)])
+            placed_order_id, _ = self.api.place_market_order(contract, "SELL", position.quantity)
+            
+            # Request open orders to ensure the API's list is updated, then try to get the full order details.
+            # A short delay might be needed for the openOrder callback to populate self.api.open_orders.
+            self.api.request_open_orders()
+            time.sleep(0.5) 
 
-            self.db.add_order(order_details['order'])
+            order_details_dict = self.api.get_open_order(placed_order_id)
 
-            order_id = order_details['order'].orderId
-            self.db.add_order_status(order_id, self._get_order_status(order_id))
+            if order_details_dict and 'order' in order_details_dict:
+                order_obj = order_details_dict['order']
+                # The 'contract' object used to place the order is already in scope.
+                # order_details_dict['contract'] should be equivalent to the 'contract' variable here.
+                self.orders.append([(order_obj, contract, False)])
+                
+                self.db.add_order(order_obj)
+                # self._get_order_status will check api.order_statuses (populated by place_market_order)
+                # and self.order_statuses (populated from DB).
+                status_to_log = self._get_order_status(placed_order_id)
+                if status_to_log:
+                    self.db.add_order_status(placed_order_id, status_to_log)
+                else:
+                    logging.warning(f"Could not get status for closing order {placed_order_id} to log to DB.")
+            else:
+                logging.error(f"Could not retrieve full order details for closing market order {placed_order_id}. Position update might be delayed or incorrect as the order won't be tracked in self.orders for immediate update.")
 
             self.update_positions()
 
