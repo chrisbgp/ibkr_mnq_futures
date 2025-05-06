@@ -436,32 +436,35 @@ class PortfolioManager:
             contract.exchange = self.config.exchange
             contract.lastTradeDateOrContractMonth = position.expiry
 
-            # Place the order
-            placed_order_id, _ = self.api.place_market_order(contract, "SELL", position.quantity)
+            # Place the order. place_market_order waits for an initial status update.
+            placed_order_id, initial_status = self.api.place_market_order(contract, "SELL", position.quantity)
             
-            # Request open orders to ensure the API's list is updated, then try to get the full order details.
-            # A short delay might be needed for the openOrder callback to populate self.api.open_orders.
-            self.api.request_open_orders()
-            time.sleep(0.5) 
+            # Construct an Order object for tracking, as get_open_order might fail if it fills too quickly.
+            closing_order_obj = Order()
+            closing_order_obj.orderId = placed_order_id
+            closing_order_obj.action = "SELL"
+            closing_order_obj.orderType = "MKT"
+            closing_order_obj.totalQuantity = position.quantity
+            # Other attributes like lmtPrice, auxPrice, parentId are not relevant for a simple MKT close.
 
-            order_details_dict = self.api.get_open_order(placed_order_id)
+            # Add this constructed order to self.orders for processing by update_positions
+            # The 'contract' object used to place the order is already in scope.
+            self.orders.append([(closing_order_obj, contract, False)])
+            logging.info(f"Appended closing market order {placed_order_id} to self.orders for tracking.")
 
-            if order_details_dict and 'order' in order_details_dict:
-                order_obj = order_details_dict['order']
-                # The 'contract' object used to place the order is already in scope.
-                # order_details_dict['contract'] should be equivalent to the 'contract' variable here.
-                self.orders.append([(order_obj, contract, False)])
-                
-                self.db.add_order(order_obj)
-                # self._get_order_status will check api.order_statuses (populated by place_market_order)
-                # and self.order_statuses (populated from DB).
-                status_to_log = self._get_order_status(placed_order_id)
-                if status_to_log:
-                    self.db.add_order_status(placed_order_id, status_to_log)
-                else:
-                    logging.warning(f"Could not get status for closing order {placed_order_id} to log to DB.")
+            # Log the order and its initial status to the database
+            self.db.add_order(closing_order_obj) 
+            
+            # Get the most up-to-date status (could have changed from initial_status if filled quickly)
+            # _get_order_status checks self.api.order_statuses first, which place_market_order populates.
+            status_to_log = self._get_order_status(placed_order_id)
+            if status_to_log:
+                self.db.add_order_status(placed_order_id, status_to_log)
+            elif initial_status: # Fallback to initial status if current is somehow None
+                logging.warning(f"Could not get current status for closing order {placed_order_id} to log to DB. Using initial status: {initial_status}")
+                self.db.add_order_status(placed_order_id, initial_status)
             else:
-                logging.error(f"Could not retrieve full order details for closing market order {placed_order_id}. Position update might be delayed or incorrect as the order won't be tracked in self.orders for immediate update.")
+                logging.error(f"Could not get any status (current or initial) for closing order {placed_order_id} to log to DB.")
 
             self.update_positions()
 
