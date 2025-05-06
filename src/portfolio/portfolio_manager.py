@@ -23,9 +23,9 @@ class PortfolioManager:
         self.db = db
 
         self.positions: List[Position] = []
-        # List of orders. Each inner list now typically contains a single limit order.
-        # bool indicates if the order's filled/cancelled state has been processed to update positions/check resubmission.
-        self.orders: List[List[(Order, bool)]] = []
+        # List of orders. Each inner list now typically contains a single limit order tuple: (Order, Optional[Contract], bool_handled_flag).
+        # bool_handled_flag indicates if the order's filled/cancelled state has been processed.
+        self.orders: List[List[(Order, Optional[Contract], bool)]] = []
         self.order_statuses: Dict[int, Dict] = {}          #order id -> order status
 
     def _get_order_status(self, order_id: int):
@@ -49,22 +49,26 @@ class PortfolioManager:
             for order, _ in bracket_order:
                 logging.info(f"Order: {str(order)}")
         
-        self.api.request_open_orders()
+        self.api.request_open_orders() # Ensures self.api.open_orders is populated for other uses if needed
 
         if len(self.orders) > 0:
             filled_count, cancelled_count, pending_count = self._get_order_status_count()
             logging.debug(f"Order statuses: {filled_count} filled, {cancelled_count} cancelled, {pending_count} pending")
 
-        for bracket_idx, bracket_order in enumerate(self.orders):
+        for bracket_idx, bracket_order_items in enumerate(self.orders):
             
-            for order_idx, (order, already_handled) in enumerate(bracket_order):
+            for order_idx, (order, contract_obj, already_handled) in enumerate(bracket_order_items):
                 
                 order_status = self._get_order_status(order.orderId)
                 
                 if order_status['status'] == 'Filled' and not already_handled:
+                    if contract_obj is None:
+                        logging.warning(f"Order {order.orderId} is filled but contract details are missing. Cannot update position from this order. This might happen for orders loaded from DB without full contract info.")
+                        # Mark as handled to avoid reprocessing this warning, or decide on other error handling
+                        self.orders[bracket_idx][order_idx] = (order, contract_obj, True)
+                        continue
 
-                    order_details = self.api.get_open_order(order.orderId)
-                    contract = order_details['contract']
+                    # Use the contract_obj stored with the order
                     # Handle filled BUY orders (Limit or Market)
                     if order.action == 'BUY' and (order.orderType == 'LMT' or order.orderType == 'MKT'):
 
@@ -72,11 +76,11 @@ class PortfolioManager:
                             logging.info(f"{order.orderType} Buy order filled, creating new position.")
 
                             position = Position(
-                            ticker=contract.symbol,
-                            security=contract.secType,
-                            currency=contract.currency,
-                            expiry=contract.lastTradeDateOrContractMonth,
-                            contract_id=contract.conId,
+                            ticker=contract_obj.symbol,
+                            security=contract_obj.secType,
+                            currency=contract_obj.currency,
+                            expiry=contract_obj.lastTradeDateOrContractMonth,
+                            contract_id=contract_obj.conId,
                             quantity=int(order.totalQuantity),
                             avg_price=order_status['avg_fill_price'],
                             timezone=self.config.timezone,
@@ -87,7 +91,7 @@ class PortfolioManager:
 
                             self.db.update_order_status(order.orderId, order_status)
 
-                            self.orders[bracket_idx][order_idx] = (order, True)
+                            self.orders[bracket_idx][order_idx] = (order, contract_obj, True)
 
                         else:
                             logging.info(f"{order.orderType} Buy order filled, updating position.")
@@ -102,7 +106,7 @@ class PortfolioManager:
                             position.quantity = total_quantity
                             position.avg_price = avg_price
 
-                            self.orders[bracket_idx][order_idx] = (order, True)
+                            self.orders[bracket_idx][order_idx] = (order, contract_obj, True)
                             
                             self.positions.append(position)
                             self.db.add_position(position)
@@ -119,12 +123,12 @@ class PortfolioManager:
                         total_quantity = position.quantity - int(order.totalQuantity)
                         avg_price = position.quantity * position.avg_price
                         avg_price += int(order.totalQuantity) * order_status['avg_fill_price'] 
-                        avg_price /= (position.quantity + int(order.totalQuantity))
+                        avg_price /= (position.quantity + int(order.totalQuantity)) # Denominator should be sum of quantities before assignment
 
                         position.quantity = total_quantity
                         position.avg_price = avg_price
                         
-                        self.orders[bracket_idx][order_idx] = (order, True)
+                        self.orders[bracket_idx][order_idx] = (order, contract_obj, True)
 
                         self.positions.append(position)
                         self.db.add_position(position)
@@ -156,7 +160,7 @@ class PortfolioManager:
             filled_count = 0
             current_order_pnl = 0
 
-            for order, _ in bracket_order:
+            for order, _, _ in bracket_order: # Adjusted to unpack three items
 
                 order_status = self._get_order_status(order.orderId)
 
@@ -216,16 +220,16 @@ class PortfolioManager:
 
         # Check if the single order status was received
         if all(self._get_order_status(order.orderId) for order in limit_order_list):
-            self._handle_successful_bracket_order(limit_order_list)
+            self._handle_successful_bracket_order(limit_order_list, contract)
         else:
-            self._handle_failed_bracket_order(limit_order_list)
+            self._handle_failed_bracket_order(limit_order_list, contract)
 
-    def _handle_successful_bracket_order(self, order_list: List[Order]):
+    def _handle_successful_bracket_order(self, order_list: List[Order], contract: Contract):
         """Handle a successful limit order submission. This is called when the order was accepted by the API."""
         logging.info("Limit order was accepted by the API.")
-        # Append as a list containing the single order tuple
-        self.orders.append(list(zip(order_list, [False] * len(order_list))))
-        self.db.add_order(order_list) # Add the single order to DB
+        # Append as a list containing the single order tuple (Order, Contract, HandledFlag)
+        self.orders.append([(o, contract, False) for o in order_list])
+        self.db.add_order(order_list) # Add the single order to DB (DB part needs future update for contract)
 
         for order in order_list:
             order_id = order.orderId
@@ -234,7 +238,7 @@ class PortfolioManager:
 
         self.update_positions()
 
-    def _handle_failed_bracket_order(self, order_list: List[Order]):
+    def _handle_failed_bracket_order(self, order_list: List[Order], contract: Contract):
         """Handle a failed limit order submission. This is called when the order status callback is not received promptly."""
         logging.error("Order callback not received for the limit order.")
         logging.warning(f"Pausing for {self.config.timeout} seconds before rechecking order status.")
@@ -249,7 +253,7 @@ class PortfolioManager:
         if order_status:
             logging.info(f"Order {limit_order.orderId} status received after pause: {order_status['status']}")
             # If status is now received, handle as successful
-            self._handle_successful_bracket_order(order_list)
+            self._handle_successful_bracket_order(order_list, contract)
         else:
             logging.error(f"Order callback still not received for order {limit_order.orderId}. Attempting cancellation.")
             try:
@@ -260,8 +264,8 @@ class PortfolioManager:
                 if final_status and final_status['status'] == 'Cancelled':
                     logging.info(f"Limit order {limit_order.orderId} was cancelled successfully after initial failure.")
                     # Add the cancelled order to DB for record keeping
-                    self.orders.append(list(zip(order_list, [True]))) # Mark as handled (cancelled)
-                    self.db.add_order(order_list)
+                    self.orders.append([(o, contract, True) for o in order_list]) # Mark as handled (cancelled)
+                    self.db.add_order(order_list) # DB part needs future update for contract
                     self.db.add_order_status(limit_order.orderId, final_status)
                 elif final_status:
                      logging.error(f"Failed to cancel order {limit_order.orderId}. Final status: {final_status['status']}. Manual intervention likely required.")
@@ -273,9 +277,9 @@ class PortfolioManager:
                 logging.error(f"Manual intervention likely required for order {limit_order.orderId}.")
 
     def has_pending_orders(self):
-        for bracket_order in self.orders:
+        for bracket_order_items in self.orders:
 
-            for order, _ in bracket_order:
+            for order, _, _ in bracket_order_items: # Adjusted to unpack three items
                 # Check status only if it exists
                 order_status_data = self._get_order_status(order.orderId)
                 if not order_status_data:
@@ -304,8 +308,8 @@ class PortfolioManager:
         found_cancelled_order = False
         orders_to_resubmit = [] # Collect orders to resubmit outside the loop
 
-        for bracket_idx, bracket_order in enumerate(self.orders):
-            for order_idx, (order, already_handled) in enumerate(bracket_order):
+        for bracket_idx, bracket_order_items in enumerate(self.orders):
+            for order_idx, (order, stored_contract, already_handled) in enumerate(bracket_order_items):
                 # Check status only if it exists
                 order_status_data = self._get_order_status(order.orderId)
                 if not order_status_data:
@@ -324,26 +328,33 @@ class PortfolioManager:
                     if self.config.resubmit_cancelled_order:
                         logging.info(f"Marking order type: {order.orderType}, id:{order.orderId} for resubmission.")
                         # Mark as handled to prevent repeated attempts in this cycle
-                        self.orders[bracket_idx][order_idx] = (order, True)
-                        # Get contract details needed for resubmission
-                        # Need to request open orders if not already done recently
-                        self.api.request_open_orders()
-                        time.sleep(0.5) # Give time for open orders to potentially populate
-                        order_details = self.api.get_open_order(order.orderId)
-                        if order_details and 'contract' in order_details:
-                             orders_to_resubmit.append(order_details['contract'])
+                        self.orders[bracket_idx][order_idx] = (order, stored_contract, True)
+                        
+                        contract_for_resubmission = stored_contract
+                        if contract_for_resubmission is None:
+                            # Fallback if contract wasn't stored (e.g. loaded from old DB format)
+                            logging.info(f"Stored contract for order {order.orderId} is None, attempting to get from API.")
+                            self.api.request_open_orders() # Ensure open orders are fresh
+                            time.sleep(0.5) 
+                            order_details = self.api.get_open_order(order.orderId)
+                            if order_details and 'contract' in order_details:
+                                contract_for_resubmission = order_details['contract']
+                            else:
+                                logging.error(f"Could not get contract details for cancelled order {order.orderId} from API. Cannot resubmit.")
+                        
+                        if contract_for_resubmission:
+                            orders_to_resubmit.append(contract_for_resubmission)
                         else:
-                             logging.error(f"Could not get contract details for cancelled order {order.orderId}. Cannot resubmit.")
-
+                            logging.error(f"No contract details available for cancelled order {order.orderId}. Cannot resubmit.")
                     else:
                         logging.info(f"Not resubmitting cancelled order type: {order.orderType}, id:{order.orderId}.")
                         # Mark as handled even if not resubmitting
-                        self.orders[bracket_idx][order_idx] = (order, True)
+                        self.orders[bracket_idx][order_idx] = (order, stored_contract, True)
 
         # Resubmit collected orders outside the iteration
-        for contract in orders_to_resubmit:
-             logging.info(f"Resubmitting order for contract {contract.symbol} {contract.lastTradeDateOrContractMonth}")
-             self.place_bracket_order(contract) # place_bracket_order now places a limit order
+        for contract_to_resubmit in orders_to_resubmit:
+             logging.info(f"Resubmitting order for contract {contract_to_resubmit.symbol} {contract_to_resubmit.lastTradeDateOrContractMonth}")
+             self.place_bracket_order(contract_to_resubmit) # place_bracket_order now places a limit order
 
         if not found_cancelled_order:
             logging.debug("No cancelled limit orders found.")
@@ -362,11 +373,11 @@ class PortfolioManager:
         cancelled_count = 0
         total_orders = 0
         
-        for bracket_order in self.orders:
+        for bracket_order_items in self.orders:
 
-            total_orders += len(bracket_order)
+            total_orders += len(bracket_order_items)
 
-            for order, _ in bracket_order:
+            for order, _, _ in bracket_order_items: # Adjusted to unpack three items
 
                 status = self._get_order_status(order.orderId)['status']
                 if status == 'Filled':
@@ -381,9 +392,9 @@ class PortfolioManager:
         """Cancel all unfilled and non-cancelled orders."""
         logging.info("Cancelling all active orders.")
         
-        for bracket_order in self.orders:
+        for bracket_order_items in self.orders:
 
-            for order, _ in bracket_order:
+            for order, _, _ in bracket_order_items: # Adjusted to unpack three items
             
                 order_status = self._get_order_status(order.orderId)
                 
@@ -504,12 +515,13 @@ class PortfolioManager:
             else:
                 filled_flags.append(False)
 
-        # Store each loaded order as a single-item list
-        single_orders = []
+        # Store each loaded order as a single-item list with None for Contract
+        # (DB schema and loading logic needs update to store/retrieve full Contract)
+        single_orders_with_contract_placeholder = []
         for order, filled_flag in zip(loaded_orders, filled_flags):
-            single_orders.append([(order, filled_flag)])
+            single_orders_with_contract_placeholder.append([(order, None, filled_flag)])
 
-        self.orders = single_orders
+        self.orders = single_orders_with_contract_placeholder
 
         logging.info("PortfolioManager: Populating positions from database.")
         logging.debug(f"PortfolioManager: Raw positions found: {len(raw_positions)}")
