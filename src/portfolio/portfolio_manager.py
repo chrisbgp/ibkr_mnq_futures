@@ -69,7 +69,10 @@ class PortfolioManager:
                 current_status_str = order_status.get('status')
 
                 if current_status_str in ['Filled', 'Cancelled', 'ApiCancelled']: # Consider various forms of "done"
-                    logging.info(f"Order {order.orderId} (Type: {order.orderType}, Action: {order.action}) has status: {current_status_str}. Updating DB and marking as handled.")
+                    logging.info(f"Order {order.orderId} (Type: {order.orderType}, Action: {order.action}, Qty: {order.totalQuantity}) "
+                                 f"has status: {current_status_str}. Updating DB and marking as handled.")
+                    # Diagnostic log:
+                    logging.info(f"DIAGNOSTIC: Marking order {order.orderId} as handled due to status: {current_status_str}.")
                     self.db.update_order_status(order.orderId, order_status)
                     self.orders[bracket_idx][order_idx] = (order, contract_obj, True) # Mark as handled
                 # Optionally, handle other statuses if specific DB logging is needed for them,
