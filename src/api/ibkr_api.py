@@ -51,6 +51,7 @@ class IBConnection(EWrapper, EClient):
         # self.current_contract = None
         self.connected = False
         self.open_orders_requested = False
+        self.position_stream_ended = False # Flag for get_positions
 
         # Lock to ensure thread-safe operations for tracking request ids
         self.lock = threading.Lock()
@@ -283,15 +284,20 @@ class IBConnection(EWrapper, EClient):
 
     def get_positions(self):
         """Get current portfolio positions"""
-        self.positions[self.account_id] = []
+        self.positions[self.account_id] = [] # Clear previous results for the account
+        self.position_stream_ended = False   # Reset flag before request
         self.reqPositions() 
 
         timeout = self.timeout
-        while not self.positions[self.account_id] and timeout > 0:
+        # Wait until positionEnd callback is received or timeout
+        while not self.position_stream_ended and timeout > 0:
             time.sleep(0.1)
             timeout -= 0.1
+        
+        if not self.position_stream_ended and timeout <= 0: # Check if timeout actually occurred
+            logging.warning("IBConnection: Timeout waiting for position stream to end. Position data might be incomplete.")
 
-        return self.positions.pop(self.account_id, [])
+        return self.positions.pop(self.account_id, []) # Return current list, or empty if account had no positions
     
     def position(self, account: str, contract: Contract, pos: float, avg_cost: float):
         """Callback for position updates"""
@@ -301,6 +307,12 @@ class IBConnection(EWrapper, EClient):
                 'position': pos,
                 'avg_cost': avg_cost
             })
+
+    def positionEnd(self):
+        """Callback for end of position stream"""
+        super().positionEnd() # EWrapper.positionEnd is just 'pass' by default
+        logging.debug("IBConnection: Position stream ended.")
+        self.position_stream_ended = True
 
     def get_account_summary(self):
         """Get all account summary information using the $LEDGER tag"""

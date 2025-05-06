@@ -563,8 +563,9 @@ class PortfolioManager:
                 latest_db_position = self.positions[-1]
                 matching_position = self.api.get_matching_position(latest_db_position)
 
-                if matching_position is None:
-                    msg = f"Inconsistent DB state: Position {latest_db_position.ticker} with quantity {latest_db_position.quantity}"
+                # If the local DB shows a position with quantity > 0, but IBKR has no record of this contract at all.
+                if latest_db_position.quantity > 0 and matching_position is None:
+                    msg = f"Inconsistent DB state: Position {latest_db_position.ticker} (ID: {latest_db_position.contract_id}) with quantity {latest_db_position.quantity}"
                     msg += f" from DB not found in IBKR. Reinitializing database and portfolio state."
                     logging.error(msg)
 
