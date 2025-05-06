@@ -23,7 +23,9 @@ class PortfolioManager:
         self.db = db
 
         self.positions: List[Position] = []
-        self.orders: List[List[(Order, bool)]] = []       #list of bracket orders (list of 3 orders). bool is for whether an order has been resubmitted when cancelled
+        # List of orders. Each inner list now typically contains a single limit order.
+        # bool indicates if the order's filled/cancelled state has been processed to update positions/check resubmission.
+        self.orders: List[List[(Order, bool)]] = []
         self.order_statuses: Dict[int, Dict] = {}          #order id -> order status
 
     def _get_order_status(self, order_id: int):
@@ -63,11 +65,11 @@ class PortfolioManager:
 
                     order_details = self.api.get_open_order(order.orderId)
                     contract = order_details['contract']
-                    
-                    if order.orderType == 'MKT' and order.action == 'BUY':
+                    # Handle filled BUY orders (Limit or Market)
+                    if order.action == 'BUY' and (order.orderType == 'LMT' or order.orderType == 'MKT'):
 
                         if len(self.positions) == 0:
-                            logging.info(f"Buy order filled, creating new position.")
+                            logging.info(f"{order.orderType} Buy order filled, creating new position.")
 
                             position = Position(
                             ticker=contract.symbol,
@@ -107,9 +109,10 @@ class PortfolioManager:
 
                             self.db.update_order_status(order.orderId, order_status)
 
-                    elif order.orderType == 'MKT' and order.action == 'SELL':
+                    # Handle filled SELL orders (Limit, Market or Stop)
+                    elif order.action == 'SELL' and (order.orderType == 'LMT' or order.orderType == 'MKT' or order.orderType == 'STP'):
 
-                        logging.info(f"Market sell order filled, updating position.")
+                        logging.info(f"{order.orderType} Sell order filled, updating position.")
 
                         position = copy.deepcopy(self.positions[-1])
 
@@ -121,27 +124,6 @@ class PortfolioManager:
                         position.quantity = total_quantity
                         position.avg_price = avg_price
                         
-                        self.orders[bracket_idx][order_idx] = (order, True)
-
-                        self.positions.append(position)
-                        self.db.add_position(position)
-
-                        self.db.update_order_status(order.orderId, order_status)
-                    
-                    elif order.orderType == 'STP' or order.orderType == 'LMT' and order.action == 'SELL':
-
-                        logging.info(f"{order.orderType} order filled, updating position.")
-
-                        position = copy.deepcopy(self.positions[-1])
-
-                        total_quantity = position.quantity - int(order.totalQuantity)
-                        avg_price = position.quantity * position.avg_price
-                        avg_price += int(order.totalQuantity) * order_status['avg_fill_price'] 
-                        avg_price /= (position.quantity + int(order.totalQuantity))
-
-                        position.quantity = total_quantity
-                        position.avg_price = avg_price
-
                         self.orders[bracket_idx][order_idx] = (order, True)
 
                         self.positions.append(position)
@@ -214,149 +196,80 @@ class PortfolioManager:
             logging.error(f"No mid price found for contract {contract.symbol}. Cannot place bracket order.")
             return
         
-        stop_loss_price = mid_price - (self.config.stop_loss_ticks * self.config.mnq_tick_size)
-        take_profit_limit_price = mid_price + (self.config.take_profit_ticks * self.config.mnq_tick_size)
+        # Calculate limit price (using the take_profit logic as a placeholder for limit price calculation)
+        # TODO: Adjust this logic if a different limit price calculation is needed.
+        limit_price = mid_price + (self.config.take_profit_ticks * self.config.mnq_tick_size)
+        limit_price = round(limit_price / self.config.mnq_tick_size) * self.config.mnq_tick_size
 
-        stop_loss_price = round(stop_loss_price/self.config.mnq_tick_size) * self.config.mnq_tick_size
-        take_profit_limit_price = round(take_profit_limit_price/self.config.mnq_tick_size) * self.config.mnq_tick_size
+        logging.debug(f"Calculated LMT price: {limit_price}")
 
-        logging.debug(f"STP price: {stop_loss_price}, LMT price: {take_profit_limit_price}")
+        # Call the (renamed but functionally different) create_bracket_order to get a single limit order list
+        # Pass 0 for stop_loss_price as it's ignored by the modified API function.
+        limit_order_list = self.api.create_bracket_order(
+            "BUY",
+            self.config.number_of_contracts,
+            limit_price,
+            0) # stop_loss_price is ignored
 
-        bracket = self.api.create_bracket_order(
-            "BUY", 
-            self.config.number_of_contracts, 
-            take_profit_limit_price, 
-            stop_loss_price)
-        
-        self.api.place_orders(bracket, contract)
+        self.api.place_orders(limit_order_list, contract)
 
-        if all(self._get_order_status(order.orderId) for order in bracket):
-            # This means all orders were accepted by the API
-            self._handle_successful_bracket_order(bracket)
+        # Check if the single order status was received
+        if all(self._get_order_status(order.orderId) for order in limit_order_list):
+            self._handle_successful_bracket_order(limit_order_list)
         else:
-            self._handle_failed_bracket_order(bracket)
+            self._handle_failed_bracket_order(limit_order_list)
 
-    def _handle_successful_bracket_order(self, bracket: List[Order]):
-        """Handle a successful bracket order. This is called when all orders were accepted by the API."""
-        logging.info("All orders were accepted by the API.")
-        self.orders.append(list(zip(bracket, [False] * len(bracket))))
-        self.db.add_order(bracket)
+    def _handle_successful_bracket_order(self, order_list: List[Order]):
+        """Handle a successful limit order submission. This is called when the order was accepted by the API."""
+        logging.info("Limit order was accepted by the API.")
+        # Append as a list containing the single order tuple
+        self.orders.append(list(zip(order_list, [False] * len(order_list))))
+        self.db.add_order(order_list) # Add the single order to DB
 
-        for order in bracket:
+        for order in order_list:
             order_id = order.orderId
             status = self._get_order_status(order_id)
             self.db.add_order_status(order_id, status)
 
         self.update_positions()
 
-    def _handle_failed_bracket_order(self, bracket: List[Order]):
-        """Handle a failed bracket order. This is called when the order is not in the order status dictionary."""
-        logging.error("Order callbacks not received for all orders.")
-        logging.warning(f"Pausing for {self.config.timeout} seconds before rechecking order statuses.")
+    def _handle_failed_bracket_order(self, order_list: List[Order]):
+        """Handle a failed limit order submission. This is called when the order status callback is not received promptly."""
+        logging.error("Order callback not received for the limit order.")
+        logging.warning(f"Pausing for {self.config.timeout} seconds before rechecking order status.")
 
         time.sleep(self.config.timeout)
 
-        logging.warning("Checking order statuses again after pause.")
+        logging.warning("Checking order status again after pause.")
 
-        for order in bracket:
-            logging.info(f"Order {order.orderId} status - {self.api.order_statuses[order.orderId]}")
+        limit_order = order_list[0] # There's only one order
+        order_status = self._get_order_status(limit_order.orderId)
 
-        # If order statuses are now received, then we can process positions
-        if all(self._get_order_status(order.orderId) for order in bracket):
-
-            self._handle_successful_bracket_order(bracket)
-
+        if order_status:
+            logging.info(f"Order {limit_order.orderId} status received after pause: {order_status['status']}")
+            # If status is now received, handle as successful
+            self._handle_successful_bracket_order(order_list)
         else:
-
-            logging.error("Order callbacks still not received for all orders. Handling cancellations")
-            
+            logging.error(f"Order callback still not received for order {limit_order.orderId}. Attempting cancellation.")
             try:
-
-                mkt_order, lmt_order, stp_order = bracket[0], bracket[1], bracket[2]
-                for left_order, order_type in zip([mkt_order, lmt_order, stp_order], ['MKT', 'LMT', 'STP']):
-                    if left_order.orderType != order_type:
-                        logging.error(f"Bracket order not in expected order. Please check.")
-
-                if not self.api.order_statuses[mkt_order.orderId]:
-                    logging.error(f"MKT order {mkt_order.orderId} is not in the order status dictionary.")
-                    logging.warning(f"Cancelling MKT order {mkt_order.orderId}")
-                    self.api.cancel_order(mkt_order.orderId)
-
-                    if self.api.order_statuses[mkt_order.orderId]['status'] == "Cancelled":
-                        logging.info(f"MKT order {mkt_order.orderId} was cancelled successfully.")
-                        logging.info(f"Now cancelling LMT and STP orders")
-
-                        self.api.cancel_order(lmt_order.orderId)
-                        self.api.cancel_order(stp_order.orderId)
-
-                        logging.info(f"LMT order {lmt_order.orderId} status: {self.api.order_statuses[lmt_order.orderId]['status']}")
-                        logging.info(f"STP order {stp_order.orderId} status: {self.api.order_statuses[stp_order.orderId]['status']}")
-
-                        if (self.api.order_statuses[lmt_order.orderId]['status'] != "Cancelled" or
-                            self.api.order_statuses[stp_order.orderId]['status'] != "Cancelled"):
-                            logging.error(f"LMT or STP order was not cancelled. Please check.")
-                            return
-
+                self.api.cancel_order(limit_order.orderId)
+                # Re-check status after cancellation attempt
+                time.sleep(1) # Short pause to allow cancellation status to potentially propagate
+                final_status = self._get_order_status(limit_order.orderId)
+                if final_status and final_status['status'] == 'Cancelled':
+                    logging.info(f"Limit order {limit_order.orderId} was cancelled successfully after initial failure.")
+                    # Add the cancelled order to DB for record keeping
+                    self.orders.append(list(zip(order_list, [True]))) # Mark as handled (cancelled)
+                    self.db.add_order(order_list)
+                    self.db.add_order_status(limit_order.orderId, final_status)
+                elif final_status:
+                     logging.error(f"Failed to cancel order {limit_order.orderId}. Final status: {final_status['status']}. Manual intervention likely required.")
                 else:
-                    logging.info(f"MKT order {mkt_order.orderId} status received: {self.api.order_statuses[mkt_order.orderId]['status']}")
-
-                if not self.api.order_statuses[lmt_order.orderId] or not self.api.order_statuses[stp_order.orderId]:
-                    # If we're here it means that the MKT order was accepted by the API but not the brackets.
-                    logging.error(f"LMT order status: {self.api.order_statuses[lmt_order.orderId]}")
-                    logging.error(f"STP order status: {self.api.order_statuses[stp_order.orderId]}")
-                    
-                    #Try to cancel the brackets
-                    self.api.cancel_order(lmt_order.orderId)
-                    self.api.cancel_order(stp_order.orderId)
-
-                    if self.api.order_statuses[lmt_order.orderId]['status'] == "Cancelled":
-                        logging.info(f"LMT order {lmt_order.orderId} was cancelled successfully.")
-                    else:
-                        logging.error(f"Could not cancel LMT order. Status: {self.api.order_statuses[lmt_order.orderId]['status']}")
-
-                    if self.api.order_statuses[stp_order.orderId]['status'] == "Cancelled":
-                        logging.info(f"STP order {stp_order.orderId} was cancelled successfully.")
-                    else:
-                        logging.error(f"Could not cancel STP order. Status: {self.api.order_statuses[stp_order.orderId]['status']}")
-
-                    # Handle case where brackets are cancelled but the market order is filled
-                    if (self.api.order_statuses[mkt_order.orderId]['status'] == "Filled" and
-                        self.api.order_statuses[lmt_order.orderId]['status'] == "Cancelled" and
-                        self.api.order_statuses[stp_order.orderId]['status'] == "Cancelled"):
-
-                        logging.warning(f"Market order {mkt_order.orderId} was filled while brackets were cancelled.")
-                        logging.warning(f"Closing open position.")
-
-                        #get order details for market order
-                        self.api.request_open_orders()
-                        
-                        order_details = self.api.get_open_order(mkt_order.orderId)
-                        contract = order_details['contract']
-
-                        # Place the order
-                        new_order_id, _ = self.api.place_market_order(contract, "SELL", mkt_order.totalQuantity)
-                        new_order_details = self.api.get_open_order(new_order_id)
-                        
-                        self.orders.append([(new_order_details['order'], False)])
-                        self.db.add_order(new_order_details['order'])
-                        self.db.add_order_status(new_order_id, self._get_order_status(new_order_id))
-
-                        self.update_positions()
-
-                    else:
-                        logging.error(f"Order statuses not received for all orders. Undefined behavior.")
-
-                else:
-                    
-                    logging.error(f"Should not be here. Order statuses received for all orders but not handled.")
-                    for order in bracket:
-                        logging.info(f"Order {order.orderId} status - {self.api.order_statuses[order.orderId]}")
+                     logging.error(f"Failed to cancel order {limit_order.orderId} and could not retrieve final status. Manual intervention likely required.")
 
             except Exception as e:
-                logging.error(f"Error handling cancellations for failed bracket order: {e}")
-
-                for order in bracket:
-                    logging.warning(f"Order {order.orderId} status - {self.api.order_statuses[order.orderId]}")
+                logging.error(f"Error during cancellation attempt for order {limit_order.orderId}: {e}")
+                logging.error(f"Manual intervention likely required for order {limit_order.orderId}.")
 
     def has_pending_orders(self):
         for bracket_order in self.orders:
@@ -566,14 +479,12 @@ class PortfolioManager:
             else:
                 filled_flags.append(False)
 
-        # Group orders into brackets of 3 orders each
-        bracket_orders = []
-        for i in range(0, len(loaded_orders), 3):
-            bracket = loaded_orders[i:i+3]
-            bracket_filled_flags = filled_flags[i:i+3]
-            bracket_orders.append(list(zip(bracket, bracket_filled_flags)))
+        # Store each loaded order as a single-item list
+        single_orders = []
+        for order, filled_flag in zip(loaded_orders, filled_flags):
+            single_orders.append([(order, filled_flag)])
 
-        self.orders = bracket_orders
+        self.orders = single_orders
 
         logging.info("PortfolioManager: Populating positions from database.")
         logging.debug(f"PortfolioManager: Raw positions found: {len(raw_positions)}")
