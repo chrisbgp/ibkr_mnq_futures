@@ -418,21 +418,87 @@ class PortfolioManager:
 
         if position.quantity > 0:
             logging.info(f"Closing position for {position.ticker} with quantity {position.quantity}")
-            matching_position = self.api.get_matching_position(position)
+            matching_position_data = self.api.get_matching_position(position)
 
-            if matching_position is None:
-                msg = f"Position {position.ticker} with quantity {position.quantity} not found in IBKR. Cannot close."
-                logging.error(msg)
-                return
+            ibkr_quantity = 0
+            if matching_position_data is not None:
+                ibkr_quantity = int(matching_position_data['position'])
 
-            native_contract_quantity = int(matching_position['position'])
-            if position.quantity > native_contract_quantity:
-                msg = f"Trying to close position {position.ticker} with quantity {position.quantity}."
-                msg += f" Only {native_contract_quantity} contracts are found on IBKR. Cannot close local position."
-                logging.error(msg)
-                return
+            if position.quantity > 0 and ibkr_quantity == 0:
+                # Local state says open, IBKR says closed/none. Correct local state.
+                logging.warning(f"CloseAll: Local position {position.ticker} (Qty: {position.quantity}) but IBKR reports 0. Updating local state to 0.")
+                position.quantity = 0
+                position.avg_price = 0.0
+                self.db.add_position(position) # Log the correction
+                # Rebuild self.positions to remove zero-quantity items
+                self.positions = [p for p in self.positions if p.quantity > 0]
+                logging.info("CloseAll: Local position state corrected. No MKT order needed as IBKR already flat.")
+                return # Position is now correctly reflected as closed locally.
+
+            elif position.quantity > 0 and ibkr_quantity > 0:
+                if position.quantity > ibkr_quantity:
+                    logging.warning(f"CloseAll: Local position {position.ticker} (Qty: {position.quantity}) but IBKR reports Qty: {ibkr_quantity}. "
+                                     f"Will attempt to close IBKR quantity: {ibkr_quantity}.")
+                    # Adjust local quantity to what IBKR reports, then close that.
+                    # This is a partial correction; full sync is populate_from_db's job.
+                    # The MKT order below will use ibkr_quantity.
+                
+                # Proceed to close the position reported by IBKR (or the lesser of local/IBKR if local was higher)
+                quantity_to_close = min(position.quantity, ibkr_quantity) # Ensure we don't try to sell more than IBKR has
+                if quantity_to_close <= 0 : # Should not happen if position.quantity > 0 and ibkr_quantity > 0
+                    logging.error(f"CloseAll: Calculated quantity_to_close is {quantity_to_close} for {position.ticker}. Aborting close attempt.")
+                    return
+
+                logging.info(f"CloseAll: Attempting to close {quantity_to_close} shares of {position.ticker} via MKT order.")
+                contract = Contract()
+                contract.symbol = position.ticker
+                contract.secType = position.security
+                contract.currency = position.currency
+                contract.exchange = self.config.exchange
+                contract.lastTradeDateOrContractMonth = position.expiry
+
+                # Place the order. place_market_order waits for an initial status update.
+                placed_order_id, initial_status = self.api.place_market_order(contract, "SELL", quantity_to_close)
             
-            contract = Contract()
+                # Construct an Order object for tracking, as get_open_order might fail if it fills too quickly.
+                closing_order_obj = Order()
+                closing_order_obj.orderId = placed_order_id
+                closing_order_obj.action = "SELL"
+                closing_order_obj.orderType = "MKT"
+                closing_order_obj.totalQuantity = quantity_to_close # Use the quantity we decided to close
+                # Other attributes like lmtPrice, auxPrice, parentId are not relevant for a simple MKT close.
+
+                # Add this constructed order to self.orders for processing by update_positions
+                # The 'contract' object used to place the order is already in scope.
+                self.orders.append([(closing_order_obj, contract, False)])
+                logging.info(f"Appended closing market order {placed_order_id} to self.orders for tracking.")
+
+                # Log the order and its initial status to the database
+                self.db.add_order(closing_order_obj) 
+                
+                # Get the most up-to-date status (could have changed from initial_status if filled quickly)
+                # _get_order_status checks self.api.order_statuses first, which place_market_order populates.
+                status_to_log = self._get_order_status(placed_order_id)
+                if status_to_log:
+                    self.db.add_order_status(placed_order_id, status_to_log)
+                elif initial_status: # Fallback to initial status if current is somehow None
+                    logging.warning(f"Could not get current status for closing order {placed_order_id} to log to DB. Using initial status: {initial_status}")
+                    self.db.add_order_status(placed_order_id, initial_status)
+                else:
+                    logging.error(f"Could not get any status (current or initial) for closing order {placed_order_id} to log to DB.")
+
+                self.update_positions() # This should process the fill and set local quantity to 0
+                return # Explicit return after attempting MKT close path
+
+            elif position.quantity <= 0 : # Local state already shows 0 or negative (error)
+                logging.info(f"CloseAll: Local position for {position.ticker} already shows quantity {position.quantity}. No action taken.")
+                return
+
+            # Fallback for unhandled scenarios, though above logic should cover typical cases
+            logging.error(f"CloseAll: Unhandled scenario for position {position.ticker} Qty: {position.quantity}, IBKR Qty: {ibkr_quantity}. No MKT order placed.")
+            return
+
+            # contract = Contract() # This line is now within the closing logic block
             contract.symbol = position.ticker
             contract.secType = position.security
             contract.currency = position.currency
