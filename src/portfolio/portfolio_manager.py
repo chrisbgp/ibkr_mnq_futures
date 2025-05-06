@@ -196,12 +196,11 @@ class PortfolioManager:
             logging.error(f"No mid price found for contract {contract.symbol}. Cannot place bracket order.")
             return
         
-        # Calculate limit price (using the take_profit logic as a placeholder for limit price calculation)
-        # TODO: Adjust this logic if a different limit price calculation is needed.
-        limit_price = mid_price + (self.config.take_profit_ticks * self.config.mnq_tick_size)
+        # Set the limit price for the BUY order to the latest mid-price
+        limit_price = mid_price
         limit_price = round(limit_price / self.config.mnq_tick_size) * self.config.mnq_tick_size
 
-        logging.debug(f"Calculated LMT price: {limit_price}")
+        logging.debug(f"Calculated LMT price (latest mid-price): {limit_price}")
 
         # Call the (renamed but functionally different) create_bracket_order to get a single limit order list
         # Pass 0 for stop_loss_price as it's ignored by the modified API function.
