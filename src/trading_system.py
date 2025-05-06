@@ -198,7 +198,7 @@ class TradingSystem:
         if position_quantity > 0 and signal == Signal.BUY:
             logging.info(f"Currently holding {position_quantity} shares of {self.config.ticker}. Cannot enter more.")
 
-        elif self.portfolio_manager.has_pending_orders() and signal == Signal.BUY:
+        elif self.portfolio_manager.has_pending_entry_order() and signal == Signal.BUY:
             logging.info("Orders are pending. Cannot enter more.")
 
         elif position_quantity == 0 and signal == Signal.BUY:
