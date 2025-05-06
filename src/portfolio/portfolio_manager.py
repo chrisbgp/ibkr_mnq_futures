@@ -154,6 +154,12 @@ class PortfolioManager:
             logging.warning("PortfolioManager: An active position already exists. Not placing new bracket order to avoid multiple active positions.")
             return
 
+        # 2. Check for existing pending *entry orders*.
+        #    self.update_positions() (called earlier) ensures 'already_handled' flags in self.orders are current.
+        if self.has_pending_entry_order():
+            logging.warning("PortfolioManager: A pending entry order (BUY LMT) already exists. Not placing new bracket order.")
+            return
+
         contract = self.get_current_contract() if contract is None else contract
 
         mid_price = self.api.get_latest_mid_price(contract)
@@ -236,26 +242,18 @@ class PortfolioManager:
                 logging.error(f"Error during cancellation attempt for order {limit_order.orderId}: {e}")
                 logging.error(f"Manual intervention likely required for order {limit_order.orderId}.")
 
-    def has_pending_orders(self):
+    def has_pending_entry_order(self): # Renamed and logic updated
+        """Checks if there's a pending BUY LMT order that hasn't been terminally handled."""
         for bracket_order_items in self.orders:
-
-            for order, _, _ in bracket_order_items: # Adjusted to unpack three items
-                # Check status only if it exists
-                order_status_data = self._get_order_status(order.orderId)
-                if not order_status_data:
-                    logging.warning(f"Could not get status for order {order.orderId} while checking for pending orders.")
-                    continue # Skip if status is unavailable
-
-                order_status = order_status_data['status']
-
-                # Check if the order is a Limit order and is still pending (not Filled or Cancelled)
-                if (order.orderType == 'LMT' and
-                    order_status != 'Filled' and
-                    order_status != 'Cancelled'):
-                    # Found a pending order
+            for order_obj, _, already_handled_flag in bracket_order_items:
+                # If an order is not yet handled (i.e., not Filled, Cancelled, or ApiCancelled by update_positions)
+                # and it's a BUY LMT order, it's considered a pending entry order.
+                if not already_handled_flag and \
+                   order_obj.action == 'BUY' and \
+                   order_obj.orderType == 'LMT':
+                    logging.info(f"Found pending entry order: ID {order_obj.orderId}, Action: {order_obj.action}, Type: {order_obj.orderType}, Handled: {already_handled_flag}")
                     return True
-
-        return False # No pending orders found
+        return False # No pending entry orders found
 
     def current_position_quantity(self):
         return self.positions[-1].quantity if len(self.positions) > 0 else 0
