@@ -144,6 +144,13 @@ class PortfolioManager:
         # update_positions calls _synchronize_positions_with_api
         self.update_positions() 
 
+        logging.info(f"PortfolioManager.place_bracket_order: Checking self.positions after update_positions():")
+        if not self.positions:
+            logging.info("  place_bracket_order: self.positions is empty.")
+        else:
+            for idx, pos_obj_log in enumerate(self.positions):
+                logging.info(f"  place_bracket_order: Position[{idx}]: Ticker={pos_obj_log.ticker}, Qty={pos_obj_log.quantity}, AvgPx={pos_obj_log.avg_price}, ConID={pos_obj_log.contract_id}")
+
         # Check if there's already an active position (quantity > 0 for any instrument)
         # self.positions is List[Position] reflecting the API state.
         active_position_exists = False
@@ -485,7 +492,12 @@ class PortfolioManager:
         
         # Update in-memory self.positions to reflect API truth
         self.positions = api_positions_list # self.positions now holds Position objects from API
-        logging.info(f"PortfolioManager: In-memory self.positions updated with {len(self.positions)} positions from API.")
+        logging.info(f"PortfolioManager: self.positions updated from API. Count: {len(self.positions)}.")
+        if self.positions:
+            for p_obj_log in self.positions:
+                 logging.debug(f"  API Position: {p_obj_log.ticker}, Qty: {p_obj_log.quantity}, AvgPx: {p_obj_log.avg_price}, ConID: {p_obj_log.contract_id}")
+        else:
+            logging.debug("  API reported no positions.")
 
         # 2. Fetch relevant current positions from Database to compare against API
         # Consider positions from the current trading day or those with non-zero quantity.
@@ -637,7 +649,8 @@ class PortfolioManager:
                                              f"with quantity {latest_db_position.quantity} in DB, but not found in IBKR.")
                 else:
                     # IBKR reports a position for this contract. Compare quantities.
-                    ibkr_quantity = int(matching_ibkr_position_data['position'])
+                    # matching_ibkr_position_data is a Position object or None
+                    ibkr_quantity = matching_ibkr_position_data.quantity 
                     if latest_db_position.quantity != ibkr_quantity:
                         # Quantities differ. This is an inconsistency.
                         inconsistent_state_detected = True
