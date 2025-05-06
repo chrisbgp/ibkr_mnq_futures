@@ -561,29 +561,33 @@ class PortfolioManager:
         if check_state:
             if len(self.positions) > 0:
                 latest_db_position = self.positions[-1]
-                matching_position = self.api.get_matching_position(latest_db_position)
+                matching_ibkr_position_data = self.api.get_matching_position(latest_db_position)
 
-                # If the local DB shows a position with quantity > 0, but IBKR has no record of this contract at all.
-                if latest_db_position.quantity > 0 and matching_position is None:
-                    msg = f"Inconsistent DB state: Position {latest_db_position.ticker} (ID: {latest_db_position.contract_id}) with quantity {latest_db_position.quantity}"
-                    msg += f" from DB not found in IBKR. Reinitializing database and portfolio state."
-                    logging.error(msg)
+                inconsistent_state_detected = False
+                error_log_message = ""
 
-                    self.cancel_all_orders()
-                    self.clear_orders_statuses_positions()
-                    self.db.reinitialize()
-                    self.db.print_all_entries()
-
-                elif latest_db_position.quantity > int(matching_position['position']):
-                    msg = f"Inconsistent DB state: Position {latest_db_position.ticker} has {latest_db_position.quantity} contracts."
-                    msg += f" Only {int(matching_position['position'])} contracts are found on IBKR."
-                    msg += f" Reinitializing database and portfolio state."
-                    logging.error(msg)
-                    
-                    self.cancel_all_orders()
-                    self.clear_orders_statuses_positions()
-                    self.db.reinitialize()
-                    self.db.print_all_entries()
+                if matching_ibkr_position_data is None:
+                    # IBKR reports no such position for this contract.
+                    if latest_db_position.quantity > 0:
+                        # Local DB claims a position exists (quantity > 0), but IBKR does not. This is an inconsistency.
+                        inconsistent_state_detected = True
+                        error_log_message = (f"Inconsistent DB state: Position {latest_db_position.ticker} (ID: {latest_db_position.contract_id}) "
+                                             f"with quantity {latest_db_position.quantity} in DB, but not found in IBKR.")
+                else:
+                    # IBKR reports a position for this contract. Compare quantities.
+                    ibkr_quantity = int(matching_ibkr_position_data['position'])
+                    if latest_db_position.quantity != ibkr_quantity:
+                        # Quantities differ. This is an inconsistency.
+                        inconsistent_state_detected = True
+                        error_log_message = (f"Inconsistent DB state: Position {latest_db_position.ticker} (ID: {latest_db_position.contract_id}) "
+                                             f"has quantity {latest_db_position.quantity} in DB, but IBKR reports quantity {ibkr_quantity}.")
+                
+                if inconsistent_state_detected:
+                    logging.error(error_log_message + " Reinitializing database and portfolio state.")
+                    self.cancel_all_orders() # Attempt to cancel any lingering orders
+                    self.clear_orders_statuses_positions() # Clear local state
+                    self.db.reinitialize() # Wipe and reinitialize DB tables
+                    self.db.print_all_entries() # Log the fresh DB state
                 else:
                     logging.info("DB state consistent with IBKR.")
 

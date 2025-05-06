@@ -552,5 +552,6 @@ class IBConnection(EWrapper, EClient):
                     contract.currency == native_contract.currency and
                     contract.lastTradeDateOrContractMonth == native_contract.lastTradeDateOrContractMonth):
                     matching_position = native_position
+                    break # Found the matching contract, no need to check further
 
             return matching_position
